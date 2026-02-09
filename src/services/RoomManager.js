@@ -2,6 +2,8 @@ const { v4: uuidv4 } = require('uuid');
 const { uniqueUsernameGenerator, adjectives, nouns } = require('unique-username-generator');
 const { getDistanceFromLatLonInMeters } = require('../utils/geo');
 
+const BotManager = require('./BotManager');
+
 class RoomManager {
     constructor() {
         this.rooms = new Map(); // roomId -> Room object
@@ -50,12 +52,72 @@ class RoomManager {
         return user;
     }
 
+    // Update user profile details
+    updateProfile(socketId, { username, gender, interest }) {
+        const user = this.users.get(socketId);
+        if (!user) return null;
+
+        if (username) user.username = username;
+        if (gender) user.gender = gender;
+        if (interest) user.interest = interest;
+
+        return user;
+    }
+
+    // Unified matching logic: Real User -> AI Bot
+    findMatch(socketId) {
+        const realMatch = this.findRealMatch(socketId);
+        if (realMatch) return { type: 'real', user: realMatch };
+
+        const botMatch = this.findBotMatch(socketId);
+        return { type: 'bot', user: botMatch };
+    }
+
+    findRealMatch(socketId) {
+        const currentUser = this.users.get(socketId);
+        if (!currentUser) return null;
+
+        let potentialMatches = [];
+        for (const [id, user] of this.users.entries()) {
+            if (id === socketId) continue;
+            if (user.status !== 'AVAILABLE') continue;
+
+            const myInterestMatches = currentUser.interest === 'ANY' || currentUser.interest === user.gender;
+            const theirInterestMatches = user.interest === 'ANY' || user.interest === currentUser.gender;
+
+            if (myInterestMatches && theirInterestMatches) {
+                potentialMatches.push(user);
+            }
+        }
+
+        if (potentialMatches.length > 0) {
+            return potentialMatches[Math.floor(Math.random() * potentialMatches.length)];
+        }
+        return null;
+    }
+
+    findBotMatch(socketId) {
+        const currentUser = this.users.get(socketId);
+        if (!currentUser) return null;
+
+        const bots = BotManager.bots;
+        const validBots = bots.filter(bot => {
+            return currentUser.interest === 'ANY' || currentUser.interest === bot.gender;
+        });
+
+        if (validBots.length > 0) {
+            return validBots[Math.floor(Math.random() * validBots.length)];
+        }
+
+        return bots[Math.floor(Math.random() * bots.length)];
+    }
+
     // Find nearby available users
     findNearbyUsers(socketId) {
         const currentUser = this.users.get(socketId);
         if (!currentUser || !currentUser.lat || !currentUser.lon) return [];
 
-        const nearbyUsers = [];
+        let nearbyUsers = [];
         for (const [id, user] of this.users.entries()) {
             if (id === socketId) continue;
             if (user.status !== 'AVAILABLE') continue;
@@ -66,26 +128,52 @@ class RoomManager {
                 user.lat, user.lon
             );
 
-            // Check if user is within current user's radius
-            // AND current user is within other user's radius (mutual discovery logic preferred, or just one way?)
-            // Usually for matching, distance should be < min(radius A, radius B) or just A's radius.
-            // Let's stick to A's radius for now as "Who is around ME".
-
             if (distance <= currentUser.radius) {
                 nearbyUsers.push({
                     id: user.id,
                     username: user.username,
                     avatar: user.avatar,
-                    distance: Math.round(distance) // send rounded distance
+                    distance: Math.round(distance),
+                    isBot: false
                 });
             }
         }
+
+        // Append AI Bots
+        const bots = BotManager.getBots(currentUser.lat, currentUser.lon).map(b => ({
+            id: b.id,
+            username: b.username,
+            avatar: b.avatar,
+            distance: b.distance,
+            isBot: true
+        }));
+
+        nearbyUsers = [...nearbyUsers, ...bots];
+
         return nearbyUsers.sort((a, b) => a.distance - b.distance);
     }
 
-    // Create a private room between two users
+    // Create a private room between two users (or user + bot)
     createPrivateRoom(userAId, userBId) {
         const userA = this.users.get(userAId);
+
+        // Check if userB is a bot
+        const bot = BotManager.getBotById(userBId);
+        if (bot) {
+            const roomId = uuidv4();
+            const newRoom = {
+                id: roomId,
+                users: [userA, bot],
+                createdAt: Date.now(),
+                type: 'private_bot',
+                botId: bot.id
+            };
+            this.rooms.set(roomId, newRoom);
+            userA.roomId = roomId;
+            userA.status = 'BUSY';
+            return newRoom;
+        }
+
         const userB = this.users.get(userBId);
 
         if (!userA || !userB) return null;
@@ -117,46 +205,35 @@ class RoomManager {
         const room = this.rooms.get(roomId);
 
         if (room) {
-            // Remove user from room
             room.users = room.users.filter(u => u.id !== socketId);
             user.roomId = null;
-            user.status = 'AVAILABLE'; // Mark as available again when leaving
+            user.status = 'AVAILABLE';
 
-            // If room is empty or 1-on-1 and one left, typically we destroy it or notify other
-            // For 1-on-1, if one leaves, the chat is essentially over.
-
-            const remainingUsers = room.users;
-
-            // Mark remaining user as available if it was a private chat and now it's just them?
-            // Or keep them in room waiting?
-            // Requirement: "When all users leave, room auto-destroy".
-            // But for 1-on-1, if one leaves, the other should probably be notified and chat ended.
-
+            // If the room becomes empty, delete it
             if (room.users.length === 0) {
                 this.rooms.delete(roomId);
                 return { roomId, user, roomDestroyed: true, remainingUsers: [] };
             } else {
-                // If it was private, the other user is now alone. 
-                // We might want to "kick" them out or just let them leave manually.
-                // For safety/UX, usually if one leaves a private chat, it ends.
-                // Let's destroy room if it was private and one left.
-                if (room.type === 'private') {
-                    // Get the other user
+                // If it's a private room (user-user or user-bot), the other user also leaves
+                if (room.type === 'private' || room.type === 'private_bot') {
                     const otherUser = room.users[0];
-                    otherUser.roomId = null;
-                    otherUser.status = 'AVAILABLE';
-                    this.rooms.delete(roomId);
+                    if (!otherUser.isBot) { // Bots don't need status updates
+                        otherUser.roomId = null;
+                        otherUser.status = 'AVAILABLE';
+                    }
+                    this.rooms.delete(roomId); // Private rooms are always deleted when one user leaves
                     return { roomId, user, roomDestroyed: true, remainingUsers: [otherUser], wasPrivate: true };
                 }
             }
-
+            // For non-private rooms (e.g., group chats, though not implemented here),
+            // the room would persist if other users remain.
             return { roomId, user, roomDestroyed: false, remainingUsers: room.users };
         }
         return null;
     }
 
     removeUser(socketId) {
-        this.leaveRoom(socketId);
+        this.leaveRoom(socketId); // Ensure user leaves any room they are in
         this.users.delete(socketId);
     }
 }

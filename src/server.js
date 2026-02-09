@@ -16,6 +16,10 @@ app.get('/', (req, res) => {
     res.send('AroundU Backend is running');
 });
 
+// Initialize Bots
+const BotManager = require('./services/BotManager');
+BotManager.initialize(process.env.GROQ_API_KEY);
+
 const io = new Server(server, {
     cors: {
         origin: process.env.CORS_ORIGIN || '*',
@@ -53,9 +57,149 @@ io.on('connection', (socket) => {
         socket.emit('nearby_users', { users: nearbyUsers });
     });
 
-    // Handle chat request
+    // Handle profile update
+    socket.on('update_profile', ({ username, gender, interest }) => {
+        const updatedUser = roomManager.updateProfile(socket.id, { username, gender, interest });
+        if (updatedUser) {
+            socket.emit('profile_updated', { user: updatedUser });
+        }
+    });
+
+    // Handle Start Matching (Direct Match Flow)
+    socket.on('start_matching', () => {
+        const currentUser = roomManager.getUser(socket.id);
+        if (!currentUser) return;
+
+        // Reset any existing room if they somehow got here
+        if (currentUser.roomId) {
+            roomManager.leaveRoom(socket.id);
+            socket.leave(currentUser.roomId);
+        }
+
+        const attemptMatch = (matchType = 'all') => {
+            const user = roomManager.getUser(socket.id);
+            if (!user || user.roomId) return false;
+
+            let match = null;
+            if (matchType === 'real') {
+                const realUser = roomManager.findRealMatch(socket.id);
+                if (realUser) match = { type: 'real', user: realUser };
+            } else {
+                match = roomManager.findMatch(socket.id);
+            }
+
+            if (!match) return false;
+
+            const targetId = match.user.id;
+            const room = roomManager.createPrivateRoom(socket.id, targetId);
+
+            if (room) {
+                socket.join(room.id);
+
+                if (match.type === 'real') {
+                    const targetSocket = io.sockets.sockets.get(targetId);
+                    if (targetSocket) {
+                        targetSocket.join(room.id);
+                    }
+                }
+
+                const uiUsers = room.users.map(u => ({
+                    ...u,
+                    username: u.id.startsWith('bot-') ? 'Stranger' : u.username
+                }));
+
+                io.to(room.id).emit('room_joined', {
+                    room: { ...room, users: uiUsers }
+                });
+                io.to(room.id).emit('room_users', { users: uiUsers });
+
+                if (match.type === 'bot') {
+                    const duration = (Math.floor(Math.random() * (180 - 120 + 1)) + 120) * 1000;
+                    setTimeout(() => {
+                        const currentRoom = roomManager.rooms.get(room.id);
+                        if (currentRoom) {
+                            io.to(room.id).emit('chat_ended', { reason: 'partner_left', autoClose: true });
+                            roomManager.leaveRoom(socket.id);
+                            socket.leave(room.id);
+                        }
+                    }, duration);
+
+                    setTimeout(async () => {
+                        const greetings = ["Hi", "Hey", "Hello", "Sup?", "Kya haal hai?", "Hlo", "Oi"];
+                        const randomGreeting = greetings[Math.floor(Math.random() * greetings.length)];
+                        const greeting = await BotManager.generateResponse(match.user.id, randomGreeting);
+                        if (greeting) {
+                            socket.emit('user_typing', { userId: match.user.id, isTyping: true });
+                            setTimeout(() => {
+                                socket.emit('user_typing', { userId: match.user.id, isTyping: false });
+                                socket.emit('receive_message', {
+                                    id: Date.now().toString(),
+                                    userId: match.user.id,
+                                    username: 'Stranger',
+                                    avatar: match.user.avatar,
+                                    text: greeting.text,
+                                    timestamp: new Date().toISOString()
+                                });
+                            }, greeting.delay);
+                        }
+                    }, 1000);
+                }
+                return true;
+            }
+            return false;
+        };
+
+        // Step 1: Try to find a real user immediately
+        const matchedNow = attemptMatch('real');
+
+        if (!matchedNow) {
+            // Step 2: If no real user, wait 6 seconds and try again (including Bot fallback)
+            setTimeout(() => {
+                // Check if user is still waiting and not already matched
+                const userAfterDelay = roomManager.getUser(socket.id);
+                if (userAfterDelay && !userAfterDelay.roomId) {
+                    attemptMatch('all');
+                }
+            }, 6000);
+        }
+    });
+
+    // Handle chat request (Legacy - keeping for backward compatibility if needed, but primarily using start_matching now)
     socket.on('request_chat', ({ targetUserId }) => {
         const currentUser = roomManager.getUser(socket.id);
+
+        // Check if target is a bot
+        const bot = BotManager.getBotById(targetUserId);
+        if (bot) {
+            // Auto-create room with bot
+            const room = roomManager.createPrivateRoom(currentUser.id, targetUserId);
+            if (room) {
+                socket.join(room.id);
+                socket.emit('room_joined', { room });
+                socket.emit('room_users', { users: room.users });
+
+                // Initial greeting from bot
+                setTimeout(async () => {
+                    const greeting = await BotManager.generateResponse(bot.id, "Hi");
+                    if (greeting) {
+                        socket.emit('user_typing', { userId: bot.id, isTyping: true });
+                        setTimeout(() => {
+                            socket.emit('user_typing', { userId: bot.id, isTyping: false });
+                            socket.emit('receive_message', {
+                                id: Date.now().toString(),
+                                userId: bot.id,
+                                username: bot.username,
+                                avatar: bot.avatar,
+                                text: greeting.text,
+                                timestamp: new Date().toISOString()
+                            });
+                        }, greeting.delay);
+                    }
+                }, 500);
+            }
+            return;
+        }
+
         const targetUser = roomManager.getUser(targetUserId);
 
         if (!currentUser || !targetUser) {
@@ -110,10 +254,11 @@ io.on('connection', (socket) => {
     });
 
     // Handle messages
-    socket.on('send_message', (messageText) => {
+    socket.on('send_message', async (messageText) => {
         const user = roomManager.users.get(socket.id);
         if (!user || !user.roomId) return;
 
+        const room = roomManager.rooms.get(user.roomId);
         const message = {
             id: Date.now().toString(),
             userId: user.id,
@@ -124,6 +269,43 @@ io.on('connection', (socket) => {
         };
 
         io.to(user.roomId).emit('receive_message', message);
+
+        // Check if chatting with a Bot
+        if (room && room.type === 'private_bot' && room.botId) {
+            const botId = room.botId;
+            const bot = BotManager.getBotById(botId);
+
+            // Trigger AI response
+            if (bot) {
+                // Simulate reading time
+                setTimeout(async () => {
+                    // Show typing indicator
+                    io.to(user.roomId).emit('user_typing', { userId: bot.id, isTyping: true });
+
+                    const response = await BotManager.generateResponse(botId, messageText);
+
+                    if (response) {
+                        // Send response after simulated delay
+                        setTimeout(() => {
+                            io.to(user.roomId).emit('user_typing', { userId: bot.id, isTyping: false });
+
+                            const botMsg = {
+                                id: Date.now().toString(),
+                                userId: bot.id,
+                                username: 'Stranger', // Hide bot name
+                                avatar: bot.avatar,
+                                text: response.text,
+                                timestamp: new Date().toISOString()
+                            };
+                            io.to(user.roomId).emit('receive_message', botMsg);
+                        }, response.delay);
+                    } else {
+                        io.to(user.roomId).emit('user_typing', { userId: bot.id, isTyping: false });
+                    }
+
+                }, 1000);
+            }
+        }
     });
 
     // Handle typing
